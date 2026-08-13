@@ -69,11 +69,11 @@ permissions:
 jobs:
   container_pipeline:
     name: Container Pipeline
-    runs-on: [self-hosted, linux, x64, aws]
+    #runs-on: [self-hosted, linux, x64, aws]
 
     # Switch back to GitHub-hosted build later by commenting the line above and
     # uncommenting the line below.
-    # runs-on: ubuntu-latest
+    runs-on: ubuntu-latest
 
     outputs:
       image_tag: ${{ steps.image_meta.outputs.image_tag }}
