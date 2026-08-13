@@ -1,0 +1,248 @@
+name: Staging Deployment
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_to_eks:
+        description: "Deploy to EKS after Docker push"
+        required: false
+        default: false
+        type: boolean
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  classify:
+    name: Classify Tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag_kind: ${{ steps.check.outputs.tag_kind }}
+    steps:
+      - name: Classify tag (case-insensitive)
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "Manual dispatch — not a tag push. Treating as a staging-only run."
+            echo "tag_kind=rc" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          TAG="${{ github.ref_name }}"
+          LOWER=$(echo "$TAG" | tr '[:upper:]' '[:lower:]')
+
+          if [[ "$LOWER" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$ ]]; then
+            echo "Tag '$TAG' matches RC pattern (vX.Y.Z-RCn). Staging only."
+            echo "tag_kind=rc" >> "$GITHUB_OUTPUT"
+          elif [[ "$LOWER" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag '$TAG' matches release pattern (vX.Y.Z, no suffix). Staging + promote to production registry."
+            echo "tag_kind=release" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag '$TAG' does not match RC or release pattern. Pipeline will not run."
+            echo "tag_kind=invalid" >> "$GITHUB_OUTPUT"
+          fi
+
+  # trigger-integration-tests:
+  #   name: Staging Unit Tests
+  #   needs: [classify]
+  #   if: ${{ needs.classify.outputs.tag_kind != 'invalid' }}
+  #   uses: ./.github/workflows/unit-test.yml
+  #   secrets: {}
+
+  container_pipeline:
+    name: Staging Container Pipeline
+    needs: [classify]
+    if: ${{ needs.classify.outputs.tag_kind != 'invalid' }}
+    uses: ./.github/workflows/container-pipeline.yml
+    with:
+      registry: docker.io
+      image_repository: ${{ vars.DOCKERHUB_STAGING_IMAGE_REPOSITORY }}
+      #django_env: STAGING
+      docker_context: .
+      dockerfile: Dockerfile
+      fail_on_gitleaks: true
+      max_image_layers: 35
+      max_image_size_mb: 3500
+      push_image: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    secrets:
+      registry_username: ${{ secrets.DOCKERHUB_USERNAME }}
+      registry_password: ${{ secrets.DOCKERHUB_TOKEN }}
+      discord_webhook: ${{ secrets.DISCORD_WEBHOOK }}
+
+  # deploy:
+  #   name: Staging Deploy To EKS
+  #   needs: [classify, trigger-integration-tests, container_pipeline]
+  #   if: ${{ needs.classify.outputs.tag_kind != 'invalid' && needs.container_pipeline.result == 'success' && needs.trigger-integration-tests.result == 'success' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy_to_eks)) }}
+  #   uses: ./.github/workflows/deploy-eks.yml
+  #   with:
+  #     aws_region: ${{ vars.AWS_REGION }}
+  #     aws_role_to_assume: ${{ vars.STAGING_GITHUB_ACTIONS_AWS_ROLE_ARN }}
+  #     eks_cluster_name: ${{ vars.STAGING_EKS_CLUSTER_NAME }}
+  #     kubernetes_namespace: ${{ vars.STAGING_KUBERNETES_NAMESPACE }}
+  #     manifest_dir: deploy/eks/staging
+  #     manifest_files: "celery-deploy.yaml payment-deploy.yaml"
+  #     docker_image: docker.io/${{ vars.DOCKERHUB_STAGING_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}
+  #     payment_deployment_name: payment-apis
+  #     payment_container_name: payment-apis
+  #     celery_enabled: true
+  #     celery_deployment_name: celery-worker
+  #     celery_container_name: celery-worker
+  #     unit_test_status: ${{ needs.trigger-integration-tests.outputs.test_status }}
+  #     trivy_status: ${{ needs.container_pipeline.outputs.trivy_status }}
+  #   secrets:
+  #     dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+  #     dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  # promote_to_production:
+  #   name: Promote Release Image To Production Registry
+  #   needs: [classify, container_pipeline]
+  #   if: ${{ needs.classify.outputs.tag_kind == 'release' && needs.container_pipeline.result == 'success' }}
+  #   runs-on: [self-hosted, linux, x64, aws]
+  #   steps:
+  #     - name: Registry login
+  #       uses: docker/login-action@v3
+  #       with:
+  #         registry: docker.io
+  #         username: ${{ secrets.DOCKERHUB_USERNAME }}
+  #         password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  #     - name: Pull the image just built for staging
+  #       run: |
+  #         docker pull "docker.io/${{ vars.DOCKERHUB_STAGING_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}"
+
+  #     - name: Tag and push to production registry (no rebuild, not deployed to prod yet)
+  #       run: |
+  #         SRC="docker.io/${{ vars.DOCKERHUB_STAGING_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}"
+  #         DEST="docker.io/${{ vars.DOCKERHUB_PRODUCTION_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}"
+  #         DEST_LATEST="docker.io/${{ vars.DOCKERHUB_PRODUCTION_IMAGE_REPOSITORY }}:latest"
+
+  #         docker tag "$SRC" "$DEST"
+  #         docker tag "$SRC" "$DEST_LATEST"
+
+  #         docker push "$DEST"
+  #         docker push "$DEST_LATEST"
+
+  #     - name: Image cleanup
+  #       if: always()
+  #       run: |
+  #         docker image rm "docker.io/${{ vars.DOCKERHUB_STAGING_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}" || true
+  #         docker image rm "docker.io/${{ vars.DOCKERHUB_PRODUCTION_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}" || true
+  #         docker image rm "docker.io/${{ vars.DOCKERHUB_PRODUCTION_IMAGE_REPOSITORY }}:latest" || true
+  #         docker image prune -af || true
+
+  # notify:
+  #   name: Pipeline Result Notification
+  #   needs:
+  #     [
+  #       classify,
+  #       trigger-integration-tests,
+  #       container_pipeline,
+  #       deploy,
+  #       promote_to_production,
+  #     ]
+  #   if: ${{ always() && needs.classify.outputs.tag_kind != 'invalid' }}
+  #   runs-on: ubuntu-latest
+  #   env:
+  #     DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+  #   steps:
+  #     - name: Download Unit Test Report
+  #       if: env.DISCORD_WEBHOOK != ''
+  #       uses: actions/download-artifact@v4
+  #       continue-on-error: true
+  #       with:
+  #         name: unit-test-report
+  #         path: reports/unit-test
+
+  #     - name: Download Trivy Report
+  #       if: env.DISCORD_WEBHOOK != ''
+  #       uses: actions/download-artifact@v4
+  #       continue-on-error: true
+  #       with:
+  #         name: trivy-report
+  #         path: reports/trivy
+
+  #     - name: Determine outcome and send single Discord alert
+  #       if: env.DISCORD_WEBHOOK != ''
+  #       run: |
+  #         UNIT_STATUS="${{ needs.trigger-integration-tests.outputs.test_status }}"
+  #         TRIVY_STATUS="${{ needs.container_pipeline.outputs.trivy_status }}"
+  #         GITLEAKS_STATUS="${{ needs.container_pipeline.outputs.gitleaks_status }}"
+
+  #         FAILED_STAGE=""
+  #         REASON=""
+
+  #         if [ "${{ needs.trigger-integration-tests.result }}" = "failure" ]; then
+  #           FAILED_STAGE="Unit Tests"
+  #           REASON="Unit test pass percentage was below the required threshold."
+  #         elif [ "${{ needs.container_pipeline.result }}" = "failure" ]; then
+  #           FAILED_STAGE="Container Pipeline"
+  #           if [ "$TRIVY_STATUS" = "FAILED" ]; then
+  #             REASON="Trivy found actionable vulnerabilities in the image."
+  #           elif [ "$GITLEAKS_STATUS" = "FAILED" ]; then
+  #             REASON="Gitleaks detected a secret in the commit history."
+  #           else
+  #             REASON="Docker image build failed."
+  #           fi
+  #         elif [ "${{ needs.deploy.result }}" = "failure" ]; then
+  #           FAILED_STAGE="Deploy To EKS"
+  #           REASON="Deployment failed, or rollout did not become healthy within the 5 minute timeout."
+  #         elif [ "${{ needs.promote_to_production.result }}" = "failure" ]; then
+  #           FAILED_STAGE="Promote To Production Registry"
+  #           REASON="Could not pull the staging image or push it to the production registry."
+  #         fi
+
+  #         if [ -n "$FAILED_STAGE" ]; then
+  #           CONTENT=$(cat <<EOF
+  #         ❌ **Pipeline Failed**
+
+  #         Repository : ${{ github.repository }}
+  #         Branch/Tag : ${{ github.ref_name }}
+
+  #         Failed at : ${FAILED_STAGE}
+  #         Reason    : ${REASON}
+
+  #         Triggered By : ${{ github.actor }}
+
+  #         🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  #         EOF
+  #           )
+  #           curl -sS -F "content=${CONTENT}" "$DISCORD_WEBHOOK"
+  #         else
+  #           if [ "${{ needs.deploy.result }}" = "success" ]; then
+  #             DEPLOY_STATUS="PASSED"
+  #           else
+  #             DEPLOY_STATUS="SKIPPED"
+  #           fi
+
+  #           UNIT_REPORT_STATUS="Not available"
+  #           [ -f reports/unit-test/unit-test-report.txt ] && UNIT_REPORT_STATUS="Attached"
+
+  #           TRIVY_REPORT_STATUS="Not available"
+  #           [ -f reports/trivy/trivy-report.txt ] && TRIVY_REPORT_STATUS="Attached"
+
+  #           CONTENT=$(cat <<EOF
+  #         🚀 **Deployment Report**
+
+  #         Repository : ${{ github.repository }}
+  #         Branch/Tag : ${{ github.ref_name }}
+
+  #         Deployment : ${DEPLOY_STATUS}
+
+  #         Unit Test Report : ${UNIT_REPORT_STATUS}
+  #         Trivy Report     : ${TRIVY_REPORT_STATUS}
+
+  #         Triggered By : ${{ github.actor }}
+
+  #         🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  #         EOF
+  #           )
+
+  #           CURL_ARGS=(-sS -F "content=${CONTENT}")
+  #           [ -f reports/unit-test/unit-test-report.txt ] && CURL_ARGS+=(-F "file1=@reports/unit-test/unit-test-report.txt")
+  #           [ -f reports/trivy/trivy-report.txt ] && CURL_ARGS+=(-F "file2=@reports/trivy/trivy-report.txt")
+
+  #           curl "${CURL_ARGS[@]}" "$DISCORD_WEBHOOK"
+  #         fi
