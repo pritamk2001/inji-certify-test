@@ -1,0 +1,32 @@
+name: No Tag Alert
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - "**"
+
+jobs:
+  alert:
+    name: Alert - No Tag Pushed
+    runs-on: ubuntu-latest
+    env:
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+    steps:
+      - name: Send No Tag Alert
+        if: env.DISCORD_WEBHOOK != ''
+        run: |
+          CONTENT=$(cat <<EOF
+          ⚠️ **No Tag Present — CI/CD Will Not Run**
+
+          Repository : ${{ github.repository }}
+          Branch     : ${{ github.ref_name }}
+          Commit     : ${{ github.sha }}
+          Triggered By : ${{ github.actor }}
+
+          Push a tag (vX.Y.Z or vX.Y.Z-RCn) to trigger the pipeline.
+          EOF
+          )
+          curl -sS -F "content=${CONTENT}" "$DISCORD_WEBHOOK"
