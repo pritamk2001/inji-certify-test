@@ -227,23 +227,36 @@ jobs:
           echo "image_ref=$IMAGE_REF" >> "$GITHUB_OUTPUT"
           echo "image_latest_ref=$IMAGE_LATEST_REF" >> "$GITHUB_OUTPUT"
 
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
       - name: Build Maven Projects
         id: maven_build
         run: |
-          export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
-          export PATH=$JAVA_HOME/bin:$PATH
-
           echo "Java version:"
           java -version
+
+          echo "JAVA_HOME:"
+          echo "$JAVA_HOME"
 
           echo "Maven version:"
           mvn -version
 
+          echo "========================================"
           echo "Building certify-core..."
+          echo "========================================"
+
           cd certify-core
           mvn clean install -Dmaven.test.skip=true -Dgpg.skip=true
 
+          echo "========================================"
           echo "Building certify-service..."
+          echo "========================================"
+
           cd ../certify-service
           mvn clean install -Dmaven.test.skip=true -Dgpg.skip=true
 
