@@ -3,7 +3,7 @@
 >   * [OpenID4VC - OpenID for Verifiable Credential Issuance - draft 13](https://openid.net/specs/openid-4-verifiable-credential-issuance-1_0-ID1.html)
 >   * [W3C VC - Verifiable Credentials Overview](https://www.w3.org/TR/vc-overview/)
 
------
+----------
 
 ### Table of Contents
 
