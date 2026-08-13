@@ -1,0 +1,566 @@
+name: Container Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      registry:
+        required: true
+        type: string
+      image_repository:
+        required: true
+        type: string
+        default: ""
+      image_tag_prefix:
+        required: false
+        type: string
+        default: ""
+      # django_env:
+      #   required: false
+      #   type: string
+      #   default: STAGING
+      docker_context:
+        required: false
+        type: string
+        default: .
+      dockerfile:
+        required: false
+        type: string
+        default: Dockerfile
+      max_image_layers:
+        required: false
+        type: number
+        default: 35
+      max_image_size_mb:
+        required: false
+        type: number
+        default: 3500
+      push_image:
+        required: false
+        type: boolean
+        default: false
+      fail_on_gitleaks:
+        required: true
+        type: boolean
+        default: false
+
+    secrets:
+      registry_username:
+        required: false
+      registry_password:
+        required: false
+      discord_webhook:
+        required: false
+
+    outputs:
+      image_tag:
+        value: ${{ jobs.container_pipeline.outputs.image_tag }}
+      image_ref:
+        value: ${{ jobs.container_pipeline.outputs.image_ref }}
+      image_latest_ref:
+        value: ${{ jobs.container_pipeline.outputs.image_latest_ref }}
+      trivy_status:
+        value: ${{ jobs.container_pipeline.outputs.trivy_status }}
+      gitleaks_status:
+        value: ${{ jobs.container_pipeline.outputs.gitleaks_status }}
+
+permissions:
+  contents: read
+
+jobs:
+  container_pipeline:
+    name: Container Pipeline
+    runs-on: [self-hosted, linux, x64, aws]
+
+    # Switch back to GitHub-hosted build later by commenting the line above and
+    # uncommenting the line below.
+    # runs-on: ubuntu-latest
+
+    outputs:
+      image_tag: ${{ steps.image_meta.outputs.image_tag }}
+      image_ref: ${{ steps.image_meta.outputs.image_ref }}
+      image_latest_ref: ${{ steps.image_meta.outputs.image_latest_ref }}
+      trivy_status: ${{ steps.trivy_report.outputs.status }}
+      gitleaks_status: ${{ steps.gitleaks.outputs.status }}
+    env:
+      DISCORD_WEBHOOK: ${{ secrets.discord_webhook }}
+      LOCAL_IMAGE_NAME: certify-service
+      TRIVY_CACHE_DIR: ${{ github.workspace }}/.cache/trivy
+
+    steps:
+      - name: Send Deployment Started Alert
+        if: always() && env.DISCORD_WEBHOOK != ''
+        run: |
+          CONTENT=$(cat <<EOF
+          🚀 **Deployment Started**
+          Repository : ${{ github.repository }}
+          Branch/Tag : ${{ github.ref_name }}
+          Trigger    : ${{ github.event_name == 'workflow_dispatch' && 'Manual' || 'Auto' }}
+          Container pipeline has started.
+          Run:
+          https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+          )
+
+          curl \
+            -F "content=${CONTENT}" \
+            "$DISCORD_WEBHOOK"
+
+      - name: Image Cleanup Step
+        run: |
+          docker image prune -af || true
+          docker builder prune -af || true
+
+      - name: clone_repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Gitleaks
+        run: |
+          VERSION="8.24.3"
+          curl -sSL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
+          tar -xzf gitleaks.tar.gz
+          chmod +x gitleaks
+          sudo mv gitleaks /usr/local/bin/
+
+      - name: Gitleaks Scan
+        id: gitleaks
+        continue-on-error: ${{ !inputs.fail_on_gitleaks }}
+        run: |
+          set +e
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || true)
+
+          if [ -z "$PREVIOUS_TAG" ]; then
+            echo "No previous tag found. Cannot determine release commit range."
+            exit 1
+          fi
+
+          echo "Previous tag : $PREVIOUS_TAG"
+          echo "Current tag  : $GITHUB_REF_NAME"
+          echo "Scan range   : ${PREVIOUS_TAG}..${GITHUB_SHA}"
+
+          gitleaks git \
+            --log-opts="${PREVIOUS_TAG}..${GITHUB_SHA}" \
+            --redact \
+            --report-format json \
+            --report-path gitleaks-report.json \
+            --exit-code 1
+
+          EXIT_CODE=$?
+
+          {
+            echo "=================================================="
+            echo "           GITLEAKS CREDENTIAL SCAN REPORT"
+            echo "=================================================="
+            echo
+            echo "Repository : ${{ github.repository }}"
+            echo "Branch     : ${{ github.ref_name }}"
+            echo "Commit     : ${{ github.sha }}"
+            echo "Generated  : $(date -u)"
+            echo
+
+            COUNT=0
+
+            if [ -f gitleaks-report.json ]; then
+              COUNT=$(jq length gitleaks-report.json)
+            fi
+
+            if [ "$COUNT" -eq 0 ]; then
+              echo "Status : PASSED ✅"
+              echo "Secrets Found : 0"
+
+              echo "status=PASSED" >> "$GITHUB_OUTPUT"
+            else
+              echo "Status : FAILED ❌"
+              echo "Secrets Found : $COUNT"
+              echo
+              echo "=================================================="
+
+              jq -r '
+                .[] |
+                "Rule        : \(.RuleID)\n" +
+                "File        : \(.File)\n" +
+                "Line        : \(.StartLine)\n" +
+                "Description : \(.Description)\n" +
+                "Commit      : \(.Commit)\n" +
+                "Author      : \(.Author)\n" +
+                "Date        : \(.Date)\n" +
+                "-----------------------------------------------"
+              ' gitleaks-report.json
+
+              echo "status=FAILED" >> "$GITHUB_OUTPUT"
+            fi
+          } > gitleaks-report.txt
+
+          if [ "${{ inputs.fail_on_gitleaks }}" = "true" ]; then
+            exit $EXIT_CODE
+          else
+            exit 0
+          fi
+
+      - name: Upload Gitleaks Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: gitleaks-report.txt
+
+      - name: Set image metadata
+        id: image_meta
+        run: |
+          SHORT_SHA="${GITHUB_SHA::12}"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            IMAGE_TAG="${GITHUB_REF_NAME}"
+          elif [ -n "${{ inputs.image_tag_prefix }}" ]; then
+            IMAGE_TAG="${{ inputs.image_tag_prefix }}-${SHORT_SHA}"
+          else
+            IMAGE_TAG="${SHORT_SHA}"
+          fi
+
+          IMAGE_LATEST_TAG="latest"
+
+          IMAGE_REF="${{ inputs.registry }}/${{ inputs.image_repository }}:${IMAGE_TAG}"
+          IMAGE_LATEST_REF="${{ inputs.registry }}/${{ inputs.image_repository }}:${IMAGE_LATEST_TAG}"
+
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "image_ref=$IMAGE_REF" >> "$GITHUB_OUTPUT"
+          echo "image_latest_ref=$IMAGE_LATEST_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Build Maven Projects
+        id: maven_build
+        run: |
+          export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+          export PATH=$JAVA_HOME/bin:$PATH
+
+          echo "Java version:"
+          java -version
+
+          echo "Maven version:"
+          mvn -version
+
+          echo "Building certify-core..."
+          cd certify-core
+          mvn clean install -Dmaven.test.skip=true -Dgpg.skip=true
+
+          echo "Building certify-service..."
+          cd ../certify-service
+          mvn clean install -Dmaven.test.skip=true -Dgpg.skip=true
+
+      - name: Build Docker Image
+        id: build_image
+        run: |
+          cd certify-service
+          docker build \
+            -f Dockerfile \
+            -t "${LOCAL_IMAGE_NAME}:${{ steps.image_meta.outputs.image_tag }}" \
+            -t "${{ steps.image_meta.outputs.image_ref }}" \
+            -t "${{ steps.image_meta.outputs.image_latest_ref }}" \
+
+      - name: Send Build Failed Alert
+        if: failure() && steps.build_image.outcome == 'failure' && env.DISCORD_WEBHOOK != ''
+        run: |
+          CONTENT=$(cat <<EOF
+          ❌ **Build Failed**
+          Repository : ${{ github.repository }}
+          Branch/Tag : ${{ github.ref_name }}
+          Image      : ${{ steps.image_meta.outputs.image_ref }}
+          Docker image build failed.
+          Run:
+          https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+          )
+
+          curl \
+            -F "content=${CONTENT}" \
+            "$DISCORD_WEBHOOK"
+
+      - name: Trivy Vulnerability Scan
+        id: trivy_vuln
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.LOCAL_IMAGE_NAME }}:${{ steps.image_meta.outputs.image_tag }}
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: "0"
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          scanners: vuln
+
+      - name: Trivy Secret Scan
+        id: trivy_secret
+        if: always()
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.LOCAL_IMAGE_NAME }}:${{ steps.image_meta.outputs.image_tag }}
+          format: table
+          exit-code: "0"
+          scanners: secret
+
+      - name: Generate Trivy Report
+        id: trivy_report
+        if: always()
+        run: |
+          STATUS="PASSED"
+          COUNT=0
+
+          if [ -f trivy-results.sarif ]; then
+
+            # Remove findings that are only related to EOL / unsupported /
+            # deprecated / version-support warnings.
+            jq '
+              .runs[].results |= map(
+                select(
+                  (
+                    (.message.text // "") |
+                    test(
+                      "(end[ -]?of[ -]?life|EOL|no longer supported|version is no longer supported|security updates are not provided|out[ -]?of[ -]?support|obsolete|deprecated|Installed Version:|Fixed Version:|Vulnerability CVE-)";
+                      "i"
+                    )
+                  ) | not
+                )
+              )
+            ' trivy-results.sarif > trivy-filtered.sarif
+
+            COUNT=$(jq '[.runs[].results[]] | length' trivy-filtered.sarif)
+
+            if [ "$COUNT" -gt 0 ]; then
+              STATUS="FAILED"
+            else
+              STATUS="PASSED"
+            fi
+
+          else
+            STATUS="ERROR"
+          fi
+
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+          echo "Trivy status: $STATUS"
+          echo "Actionable findings: $COUNT"
+
+          if [ "$STATUS" = "PASSED" ]; then
+            {
+              echo "===================================================="
+              echo "                 TRIVY SCAN REPORT"
+              echo "===================================================="
+              echo
+              echo "Repository : ${{ github.repository }}"
+              echo "Branch     : ${{ github.ref_name }}"
+              echo "Image      : ${{ steps.image_meta.outputs.image_ref }}"
+              echo "Generated  : $(date -u)"
+              echo
+              echo "Status : PASSED ✅"
+              echo "Actionable Vulnerabilities : 0"
+              echo
+              echo "EOL/version-related warnings are excluded."
+            } > trivy-report.txt
+
+            echo "Trivy PASSED. Report generated."
+            exit 0
+          fi
+
+          # ------------------------------------------------
+          # FAILED - generate report
+          # ------------------------------------------------
+          if [ "$STATUS" = "FAILED" ]; then
+
+            {
+              echo "===================================================="
+              echo "                 TRIVY SCAN REPORT"
+              echo "===================================================="
+              echo
+              echo "Repository : ${{ github.repository }}"
+              echo "Branch     : ${{ github.ref_name }}"
+              echo "Image      : ${{ steps.image_meta.outputs.image_ref }}"
+              echo "Generated  : $(date -u)"
+              echo
+              echo "Status : FAILED ❌"
+              echo "Actionable Vulnerabilities : $COUNT"
+              echo
+              echo "EOL/version-related warnings are excluded."
+              echo
+
+              jq -r '
+              [.runs[].results[]]
+              | .[:100]
+              | .[]
+              | "Severity : \(.level)\n" +
+              "Rule     : \(.ruleId)\n" +
+              "Message  : \(.message.text)\n" +
+                "------------------------------------------"
+              ' trivy-filtered.sarif
+
+            } > trivy-report.txt
+
+            echo "Actionable vulnerability found. Failing pipeline."
+            exit 1
+          fi
+
+          # ------------------------------------------------
+          # ERROR
+          # ------------------------------------------------
+          if [ "$STATUS" = "ERROR" ]; then
+
+            {
+              echo "===================================================="
+              echo "                 TRIVY SCAN REPORT"
+              echo "===================================================="
+              echo
+              echo "Repository : ${{ github.repository }}"
+              echo "Branch     : ${{ github.ref_name }}"
+              echo "Image      : ${{ steps.image_meta.outputs.image_ref }}"
+              echo "Generated  : $(date -u)"
+              echo
+              echo "Status : ERROR ❌"
+              echo "Trivy scan did not generate a valid SARIF report."
+            } > trivy-report.txt
+
+            exit 1
+          fi
+
+      - name: Send Trivy Failed Alert
+        if: always() && steps.trivy_report.outputs.status == 'FAILED' && env.DISCORD_WEBHOOK != ''
+        run: |
+          CONTENT=$(cat <<EOF
+          🚨 **Trivy Vulnerability Scan Failed**
+
+          Repository : ${{ github.repository }}
+          Branch/Tag : ${{ github.ref_name }}
+          Image      : ${{ steps.image_meta.outputs.image_ref }}
+
+          Status : ❌ FAILED
+          Actionable Vulnerabilities : ${{ steps.trivy_report.outputs.count }}
+
+          EOL/version-related warnings are excluded.
+
+          Run:
+          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+          )
+
+          CURL_ARGS=(
+            -F "content=${CONTENT}"
+          )
+
+          if [ -f trivy-report.txt ]; then
+            CURL_ARGS+=(-F "file=@trivy-report.txt")
+          fi
+
+          curl -sS "${CURL_ARGS[@]}" "$DISCORD_WEBHOOK"
+
+      - name: Upload Trivy Report
+        if: always() && (steps.trivy_report.outputs.status == 'PASSED' || steps.trivy_report.outputs.status == 'FAILED')
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: trivy-report.txt
+
+      - name: Registry Login
+        if: ${{ inputs.push_image && steps.trivy_report.outputs.status == 'PASSED' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ secrets.registry_username }}
+          password: ${{ secrets.registry_password }}
+
+      - name: Push Image
+        id: push_image
+        if: ${{ inputs.push_image && steps.trivy_report.outputs.status == 'PASSED' }}
+        run: |
+          docker push "${{ steps.image_meta.outputs.image_ref }}"
+          docker push "${{ steps.image_meta.outputs.image_latest_ref }}"
+
+      - name: Send Image Push Failed Alert
+        if: failure() && steps.push_image.outcome == 'failure' && env.DISCORD_WEBHOOK != ''
+        run: |
+          CONTENT=$(cat <<EOF
+          ❌ **Image Push Failed**
+          Repository : ${{ github.repository }}
+          Branch/Tag : ${{ github.ref_name }}
+          Image      : ${{ steps.image_meta.outputs.image_ref }}
+          Docker Hub image push failed.
+          Run:
+          https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+          )
+          curl \
+          -F "content=${CONTENT}" \
+          "$DISCORD_WEBHOOK"
+
+      - name: Image Cleanup Step 
+        if: always()
+        run: |
+          docker image rm "${LOCAL_IMAGE_NAME}:${{ steps.image_meta.outputs.image_tag }}" || true
+          docker image rm "${{ steps.image_meta.outputs.image_ref }}" || true
+          docker image rm "${{ steps.image_meta.outputs.image_latest_ref }}" || true
+          docker image prune -af || true
+          docker builder prune -af || true
+
+      - name: Send Security Reports to Discord
+        if: always() && env.DISCORD_WEBHOOK != ''
+        run: |
+          GITLEAKS_STATUS="${{ steps.gitleaks.outputs.status }}"
+          TRIVY_STATUS="${{ steps.trivy_report.outputs.status }}"
+
+          [ -z "$GITLEAKS_STATUS" ] && GITLEAKS_STATUS="UNKNOWN"
+          [ -z "$TRIVY_STATUS" ] && TRIVY_STATUS="UNKNOWN"
+
+          # ================================================
+          # CONTAINER PIPELINE FAILURE ONLY
+          # ================================================
+          if [ "$GITLEAKS_STATUS" != "PASSED" ] || [ "$TRIVY_STATUS" != "PASSED" ]; then
+
+            CONTENT=$(cat <<EOF
+          ❌ **Container Pipeline FAILED**
+
+          Repository : ${{ github.repository }}
+          Branch     : ${{ github.ref_name }}
+
+          Gitleaks : ${GITLEAKS_STATUS}
+          Trivy    : ${TRIVY_STATUS}
+
+          Security scan failed. Deployment will not start.
+
+          Run:
+          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+            )
+
+            CURL_ARGS=(
+              -sS
+              -F "content=${CONTENT}"
+            )
+
+            # Gitleaks report only when failed
+            if [ "$GITLEAKS_STATUS" = "FAILED" ] && [ -f gitleaks-report.txt ]; then
+              CURL_ARGS+=(
+                -F "file1=@gitleaks-report.txt"
+              )
+            fi
+
+            # Trivy report only when failed
+            if [ "$TRIVY_STATUS" = "FAILED" ] && [ -f trivy-report.txt ]; then
+              CURL_ARGS+=(
+                -F "file2=@trivy-report.txt"
+              )
+            fi
+
+            curl "${CURL_ARGS[@]}" "$DISCORD_WEBHOOK"
+          fi
+
+      - name: post hook
+        if: always()
+        run: |
+          {
+            echo "## Container pipeline summary"
+            echo ""
+            echo "- Status: ${{ job.status }}"
+            echo "- Image tag: ${{ steps.image_meta.outputs.image_tag }}"
+            echo "- Image ref: ${{ steps.image_meta.outputs.image_ref }}"
+            echo "- Latest convenience tag: ${{ steps.image_meta.outputs.image_latest_ref }}"
+            echo "- Push enabled: ${{ inputs.push_image }}"
+          } >> "$GITHUB_STEP_SUMMARY"
